@@ -1,0 +1,48 @@
+#!/bin/bash
+# PSX-aware assembler shim for decomp-permuter.
+#
+# The permuter invokes its assembler as `<assembler> <in> -o <out>`, but this
+# project's PSX assembly needs maspsx first (GNU as does not know the GTE opcodes,
+# and silently mis-assembles anything it cannot decode). maspsx in turn reads from
+# stdin and pops its *last* argument as a fallback input file, which under the
+# permuter's argument order would be the output path. So feed it explicitly.
+#
+# Anything after the input/output pair is forwarded to GNU as unchanged.
+set -euo pipefail
+
+in=""
+out=""
+extra=()
+args=("$@")
+i=0
+while [ "$i" -lt "${#args[@]}" ]; do
+    a="${args[$i]}"
+    case "$a" in
+        -o)
+            out="${args[$((i + 1))]}"
+            i=$((i + 2))
+            continue
+            ;;
+        -o*)
+            out="${a#-o}"
+            ;;
+        *)
+            if [ -z "$in" ] && [ -f "$a" ]; then
+                in="$a"
+            else
+                extra+=("$a")
+            fi
+            ;;
+    esac
+    i=$((i + 1))
+done
+
+if [ -z "$in" ] || [ -z "$out" ]; then
+    echo "psx-as: need an input file and -o <output>" >&2
+    exit 2
+fi
+
+exec tools/python/bin/python tools/maspsx/maspsx.py \
+    --aspsx-version=2.77 --macro-inc --force-stdin \
+    --run-assembler --gnu-as-path mipsel-linux-gnu-as \
+    "${extra[@]+"${extra[@]}"}" -o "$out" <"$in"

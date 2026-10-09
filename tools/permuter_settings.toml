@@ -1,5 +1,31 @@
 compiler_type = "gcc"
 
+# The permuter's defaults are all big-endian MIPS and know nothing about the PSX GTE
+# opcodes, so none of its three external tools work out of the box on this project.
+# Each is pinned to the little-endian equivalent below.
+#
+# The compiler is the full C -> .o pipeline (preprocess, vsStringTransformer, cc1,
+# maspsx, as). The permuter splices "$INPUT" in before the first `|` and
+# `-o "$OUTPUT"` onto the end, so the pipeline is written without them.
+#
+# This is the 2.7.2-cdk pipeline. Change the cc1 path to match whichever compiler
+# the function under study is pinned to in config/EFFECT/Makefile.
+compiler_command = "cc -E -nostdinc -I include/psx -I src/include -I ./ -D '__attribute__(x)=' -D_LANGUAGE_C | tools/python/bin/python3 -m tools.etc.vsStringTransformer | tools/old-gcc/2.7.2-cdk/cc1 -G0 -O2 -Wall -quiet -fno-builtin -funsigned-char -Wno-unused | tools/python/bin/python3 tools/maspsx/maspsx.py --aspsx-version=2.77 --macro-inc | mipsel-linux-gnu-as -I include -G0 -no-pad-sections"
+
+# GNU as does not know the GTE opcodes and silently drops anything it cannot decode,
+# so the target assembly has to go through maspsx first. tools/dev/psx-as wraps that.
+assembler_command = "bash tools/dev/psx-as -march=vr4300 -mabi=32 -G0 -no-pad-sections -I include"
+
+# The vendored prelude.inc redefines the label macros that include/macro.inc already
+# provides, which maspsx pulls in via --macro-inc; that collides as duplicate macro
+# definitions. Keep only the .set directives here and let macro.inc own the macros.
+asm_prelude_file = "tools/dev/permuter-prelude.inc"
+
+# Same endianness problem in the scorer's disassembler. The flags mirror what the
+# vendored mips ArchSettings would have supplied -- a custom command replaces them
+# wholesale rather than being appended to.
+objdump_command = "mipsel-linux-gnu-objdump -drz -m mips:4300"
+
 [decompme]
 compilers."cc" = "gcc2.8.1-psx"
 flags = "-O2 -G0 -g -Wall -funsigned-char -Wa,--aspsx-version=2.77"
