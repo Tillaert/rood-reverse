@@ -44,6 +44,7 @@ OBJDIFF = "tools/objdiff/objdiff-cli"
 OBJCOPY = "mipsel-linux-gnu-objcopy"
 OBJDUMP = "mipsel-linux-gnu-objdump"
 NM = "mipsel-linux-gnu-nm"
+COMPILERS = ("2.7.2-psx", "2.7.2-cdk", "2.8.1-psx")
 
 # func_800F9818 / D_800F1234 style names carry the *original* address.
 NAME_ADDR = re.compile(r"^(?:func|D|d|lbl|lbl|lohi|hi_?|lo_?)_?([0-9A-Fa-f]{8})$")
@@ -233,6 +234,31 @@ def norm_addr(text, lo, hi, base):
     return re.sub(r"0x8[0-9A-Fa-f]{7}", sub, text)
 
 
+BASE_TARGET = re.compile(r"^(j|jal)\s+(func_)?(0x)?([0-9A-Fa-f]{1,8})$")
+
+
+def norm_base_targets(text, lo, hi, base):
+    """Rebuild the base object's truncated branch targets as relative offsets.
+
+    With no symbol table, objdiff renders `j`/`jal` operands from the raw 26-bit
+    jump field, so an in-overlay target shows as e.g. `0xfa334` and a call into
+    the main executable as `func_00043E3C`. Both are really 0x80000000-anchored
+    addresses; restoring the anchor lets them compare against our side's resolved
+    form instead of reading as a false difference on every branch.
+    """
+    m = BASE_TARGET.match(text)
+    if not m:
+        return text
+    mnem, is_func, _, literal = m.groups()
+    v = int(literal, 16)
+    if v >= 0x80000000:
+        return text
+    v |= 0x80000000
+    if lo <= v < hi:
+        return f"{mnem} {v - base:#x}"
+    return f"{mnem} func_{v:08X}" if is_func else f"{mnem} {v:#x}"
+
+
 def report_objdiff(d, func, limit, context, norm=None):
     ours = side_instructions(d.get("left") or {}, func)
     orig = side_instructions(d.get("right") or {}, func)
@@ -243,7 +269,8 @@ def report_objdiff(d, func, limit, context, norm=None):
     if norm:
         lo, hi, base = norm
         ours = [norm_addr(t, lo, hi, base) for t in ours]
-        orig = [norm_addr(t, lo, hi, base) for t in orig]
+        orig = [norm_addr(norm_base_targets(t, lo, hi, base), lo, hi, base)
+                for t in orig]
 
     sm = difflib.SequenceMatcher(None, ours, orig, autojunk=False)
     same = sum(b.size for b in sm.get_matching_blocks())
@@ -270,18 +297,152 @@ def report_objdiff(d, func, limit, context, norm=None):
                 print(f"    {label} {k:4}  {arr[k]}")
 
 
+def frame_size(obj):
+    """The function's stack frame, read from its prologue."""
+    d = subprocess.run([OBJDUMP, "-d", obj], capture_output=True, text=True).stdout
+    m = re.search(r"addiu\s+(?:\$)?sp,(?:\$)?sp,(-?\d+)", d)
+    return abs(int(m.group(1))) if m else None
+
+
+def compiler_sweep(mod, fn):
+    """Build the same source under every available compiler and report which one
+    reproduces the original most closely.
+
+    EFFECT is a mixed toolchain: the category-wide 2.8.1-psx pin is correct for
+    the files already decompiled, but some original overlays were built with the
+    PSYQ CDK compiler instead. Rather than guessing per candidate, compile it
+    under all three and let the frame size and alignment pick.
+    """
+    elf = f"{BUILD}/data/EFFECT/{mod}.elf"
+    orig_addr = original_addr(fn)
+    vram = overlay_vram(mod)
+    hi = hi_of(mod)
+    off = orig_addr - vram
+    with open(f"{ORIG}/EFFECT/{mod}", "rb") as f:
+        f.seek(off)
+        orig_blob = f.read()
+
+    # The object we care about is whichever .c in this module defines `fn`.
+    mod_dir = f"src/EFFECT/{mod}"
+    srcs = []
+    for dp, _dirs, files in os.walk(mod_dir):
+        for name in files:
+            if not name.endswith(".c"):
+                continue
+            path = os.path.join(dp, name)
+            if fn in open(path, errors="ignore").read():
+                srcs.append(path)
+    if not srcs:
+        sys.exit(f"no source under {mod_dir} mentions {fn}")
+    objs = [f"{BUILD}/{s}.o" for s in srcs]
+
+    of = orig_frame(mod, fn)
+    of = abs(of) if of else None
+    print(f"{fn}  original frame {f'0x{of:x}' if of else '?'}")
+    print(f"  {'compiler':<14} {'frame':>8}  {'vs orig':>8}  "
+          f"{'aligned':>8}  verdict")
+
+    rows = []
+    for ver in COMPILERS:
+        for stale in objs + [elf]:
+            if os.path.exists(stale):
+                os.unlink(stale)
+        r = subprocess.run(["make", elf, f"CC1VER={ver}",
+                           "DISKIMAGE=/SLUS-01040.bin"],
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            print(f"  {ver:<14} {'-':>8}  {'-':>8}  {'-':>8}  build failed")
+            continue
+
+        our_addr, _, size = locate(elf, fn)
+        if not size:
+            print(f"  {ver:<14} {'-':>8}  {'-':>8}  {'-':>8}  "
+                  f"no size for {fn}")
+            continue
+        ow = our_words_from_elf(elf, our_addr, size)
+        rw = words(orig_blob[:size])
+        frame = next((frame_size(o) for o in objs
+                     if os.path.exists(o) and frame_size(o)), None)
+        fs = f"0x{frame:x}" if frame else "?"
+        delta = f"{frame - of:+d}" if (frame and of) else "?"
+
+        if ow == rw:
+            print(f"  {ver:<14} {fs:>8}  {delta:>8}  {'--':>8}  MATCH")
+            rows.append((ver, frame, 100.0))
+            continue
+
+        with tempfile.TemporaryDirectory() as td:
+            base = os.path.join(td, "base.o")
+            make_base_object(orig_blob[:size], fn, base)
+            d = run_objdiff(elf, base, fn)
+        pct = None
+        if d:
+            ours = [norm_addr(t, vram, hi, orig_addr)
+                   for t in side_instructions(d.get("left") or {}, fn)]
+            origl = [norm_addr(norm_base_targets(t, vram, hi, orig_addr),
+                              vram, hi, orig_addr)
+                     for t in side_instructions(d.get("right") or {}, fn)]
+            sm = difflib.SequenceMatcher(None, ours, origl, autojunk=False)
+            pct = 100.0 * sum(b.size for b in sm.get_matching_blocks()) \
+                / max(1, len(origl))
+        print(f"  {ver:<14} {fs:>8}  {delta:>8}  "
+              f"{f'{pct:.1f}%' if pct is not None else '?':>8}  differs")
+        rows.append((ver, frame, pct))
+
+    match = [r for r in rows if r[2] == 100.0]
+    if match:
+        print(f"\n  -> {match[0][0]} reproduces the original bytes")
+    else:
+        ranked = sorted((r for r in rows if r[2] is not None),
+                       key=lambda r: -r[2])
+        if ranked:
+            print(f"\n  -> closest: {ranked[0][0]} at {ranked[0][2]:.1f}% aligned")
+
+
+def hi_of(mod):
+    return overlay_vram(mod) + os.path.getsize(f"{ORIG}/EFFECT/{mod}")
+
+
+def orig_frame(mod, fn):
+    """The original function's frame, decoded from its own prologue word.
+
+    addiu is opcode 9; both source and target must be $sp for this to be the
+    frame allocation rather than some other arithmetic on the stack pointer.
+    """
+    addr = original_addr(fn)
+    if addr is None:
+        return None
+    off = addr - overlay_vram(mod)
+    with open(f"{ORIG}/EFFECT/{mod}", "rb") as f:
+        f.seek(off)
+        w = int.from_bytes(f.read(4), "little")
+    if (w >> 26) != 0x09:
+        return None
+    if ((w >> 21) & 0x1F) != 29 or ((w >> 16) & 0x1F) != 29:
+        return None
+    imm = w & 0xFFFF
+    return imm - 0x10000 if imm >= 0x8000 else imm
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("module")
     ap.add_argument("function")
     ap.add_argument("--raw", action="store_true")
     ap.add_argument("--no-build", action="store_true")
+    ap.add_argument("--compilers", action="store_true",
+                    help="build under every available compiler and report which "
+                         "one reproduces the original")
     ap.add_argument("--no-norm", action="store_true",
                     help="show absolute addresses instead of relative offsets")
     ap.add_argument("-n", type=int, default=12, help="hunks to show")
     ap.add_argument("-c", dest="context", type=int, default=2,
                     help="context lines per hunk")
     a = ap.parse_args()
+
+    if a.compilers:
+        compiler_sweep(a.module, a.function)
+        return
 
     mod, fn = a.module, a.function
     elf = f"{BUILD}/data/EFFECT/{mod}.elf"
