@@ -30,6 +30,7 @@ Examples:
 """
 import argparse
 import difflib
+import glob
 import json
 import os
 import re
@@ -297,6 +298,33 @@ def report_objdiff(d, func, limit, context, norm=None):
                 print(f"    {label} {k:4}  {arr[k]}")
 
 
+def true_orig_size(mod, fn, orig_addr):
+    """The original function's real length, taken from splat's own disassembly.
+
+    Our function and the original need not be the same length. Slicing the
+    pristine overlay by *our* size therefore reads silently past the end of the
+    original function and reports the following function's instructions as
+    unexplained differences -- and shrinks the alignment denominator. splat's
+    nonmatching .s carries the authoritative extent, so use that when present.
+    """
+    hits = glob.glob(f"{BUILD}/src/EFFECT/{mod}/nonmatchings/**/{fn}.s",
+                    recursive=True)
+    if not hits:
+        return None
+    pat = re.compile(r"/\*\s*[0-9A-F]+\s+([0-9A-F]{8})\s+[0-9A-F]{8}\s*\*/")
+    try:
+        text = open(hits[0], errors="ignore").read()
+    except OSError:
+        return None
+    # The .s also holds the function's .rodata jump table at a lower address,
+    # so keep only the words that actually belong to the body.
+    body = [int(m.group(1), 16) for m in pat.finditer(text)
+            if int(m.group(1), 16) >= orig_addr]
+    if not body:
+        return None
+    return max(body) + 4 - orig_addr
+
+
 def frame_size(obj):
     """The function's stack frame, read from its prologue."""
     d = subprocess.run([OBJDUMP, "-d", obj], capture_output=True, text=True).stdout
@@ -359,8 +387,9 @@ def compiler_sweep(mod, fn):
             print(f"  {ver:<14} {'-':>8}  {'-':>8}  {'-':>8}  "
                   f"no size for {fn}")
             continue
+        tsize = true_orig_size(mod, fn, orig_addr) or size
         ow = our_words_from_elf(elf, our_addr, size)
-        rw = words(orig_blob[:size])
+        rw = words(orig_blob[:tsize])
         frame = next((frame_size(o) for o in objs
                      if os.path.exists(o) and frame_size(o)), None)
         fs = f"0x{frame:x}" if frame else "?"
@@ -373,7 +402,7 @@ def compiler_sweep(mod, fn):
 
         with tempfile.TemporaryDirectory() as td:
             base = os.path.join(td, "base.o")
-            make_base_object(orig_blob[:size], fn, base)
+            make_base_object(orig_blob[:tsize], fn, base)
             d = run_objdiff(elf, base, fn)
         pct = None
         if d:
@@ -386,7 +415,8 @@ def compiler_sweep(mod, fn):
             pct = 100.0 * sum(b.size for b in sm.get_matching_blocks()) \
                 / max(1, len(origl))
         print(f"  {ver:<14} {fs:>8}  {delta:>8}  "
-              f"{f'{pct:.1f}%' if pct is not None else '?':>8}  differs")
+              f"{f'{pct:.1f}%' if pct is not None else '?':>8}  "
+              f"differs ({len(ow) - len(rw):+d}w)")
         rows.append((ver, frame, pct))
 
     match = [r for r in rows if r[2] == 100.0]
@@ -460,9 +490,10 @@ def main():
     if not size:
         sys.exit(f"{fn} has no size in {elf}")
     off = orig_addr - overlay_vram(mod)
+    tsize = true_orig_size(mod, fn, orig_addr) or size
     with open(orig_bin, "rb") as f:
         f.seek(off)
-        orig_blob = f.read(size)
+        orig_blob = f.read(tsize)
 
     rw = words(orig_blob)
     ow = our_words_from_elf(elf, our_addr, size)
@@ -473,8 +504,9 @@ def main():
         return
 
     common = min(len(ow), len(rw))
+    delta = len(ow) - len(rw)
     print(f"{fn}  ours {our_addr:#x} / orig {orig_addr:#x}  "
-          f"ours={len(ow)}w orig={len(rw)}w  DIFFERS  "
+          f"ours={len(ow)}w orig={len(rw)}w ({delta:+d}w)  DIFFERS  "
           f"{sum(x != y for x, y in zip(ow, rw))}/{common} words differ")
 
     if a.raw:
