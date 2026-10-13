@@ -40,58 +40,6 @@ typedef struct {
 
 #endif /* VS_RIBBON_TYPES */
 
-/* Load the look-at matrix into $0-$4 and the eye vector into $5-$7. The staging
- * registers and the coprocessor indices are all part of the original encoding,
- * so they are pinned here rather than left to the allocator.
- *
- * `eye` is deliberately listed twice. GCC 2.8 ranks a value for a callee-saved
- * register by log2(uses) * uses / lifetime, and the original keeps the eye in
- * $s7 and the ribbon list in $fp -- a margin of about seven percent. The second
- * operand is the notch that makes the allocator agree; it is unreferenced in the
- * template, so it emits nothing. */
-#define vs_ribbon_setMatEye(mat, eye) \
-    __asm__ volatile("lw $t4,0x0(%0);" \
-                    "lw $t5,0x4(%0);" \
-                    "ctc2 $t4,$0;" \
-                    "ctc2 $t5,$1;" \
-                    "lw $t4,0x8(%0);" \
-                    "lw $t5,0xc(%0);" \
-                    "lw $t6,0x10(%0);" \
-                    "ctc2 $t4,$2;" \
-                    "ctc2 $t5,$3;" \
-                    "ctc2 $t6,$4;" \
-                    "lw $t4,0x0(%1);" \
-                    "lw $t5,0x4(%1);" \
-                    "ctc2 $t4,$5;" \
-                    "lw $t6,0x8(%1);" \
-                    "ctc2 $t5,$6;" \
-                    "ctc2 $t6,$7" \
-                    : \
-                    : "r"(mat), "r"(eye), "r"(eye) \
-                    : "$12", "$13", "$14")
-
-/* Push one offset through the coprocessor. The matrix and eye loaded above are
- * still resident, so neither is needed again. */
-#define vs_ribbon_gtePush(src) \
-    __asm__ volatile("lwc2 $0,0x0(%0);" \
-                    "lwc2 $1,0x4(%0);" \
-                    "nop;" \
-                    "nop;" \
-                    "mvmva 1,0,0,0,0" \
-                    : \
-                    : "r"(src))
-
-/* Read the transformed vector back out of the coprocessor. Kept separate from the
- * push so the destination pointer is materialised only when the stores want it --
- * that is where the original's load-delay filler comes from. */
-#define vs_ribbon_gtePull(out) \
-    __asm__ volatile("swc2 $25,0x0(%0);" \
-                    "swc2 $26,0x4(%0);" \
-                    "swc2 $27,0x8(%0)" \
-                    : \
-                    : "r"(out) \
-                    : "memory")
-
 void VS_RIBBON_FUNCTION(func_800FA098_arg0* effect, func_800FA098_arg1* scratch,
     int unused, vs_ribbonList* list)
 {
@@ -184,12 +132,25 @@ void VS_RIBBON_FUNCTION(func_800FA098_arg0* effect, func_800FA098_arg1* scratch,
         vs_battle_svecToVec((SVECTOR*)node, eye);
         vs_battle_svecToVec((SVECTOR*)&node->to, target);
         vs_battle_lookAt(eye, target, &scratch->unk64);
-        vs_ribbon_setMatEye(&scratch->unk64, eye);
-        vs_ribbon_gtePush(&offsets[0]);
-        vs_ribbon_gtePull(eye);
+
+        /* The eye has to stay in a callee-saved register across the whole loop,
+         * and GCC 2.8 decides that by score: floor(log2(refs)) * refs / lifetime.
+         * Measured here the eye comes out at 11 refs / 192 live = 1718 against
+         * the ribbon list's 18 refs / 390 = 1846, so the list wins $s7 and the
+         * eye falls to $fp -- the reverse of the original. Twelve refs puts the
+         * eye at 1875 and the ordering right. The empty asm below is the twelfth
+         * reference; it constrains the value to a register and emits nothing. */
+        __asm__ volatile("" ::"r"(eye));
+
+        gte_SetRotMatrix(&scratch->unk64);
+        gte_SetTransVector2(eye);
+        gte_ldv0(&offsets[0]);
+        gte_rtv0tr2();
+        gte_stlvnl(eye);
         vs_battle_vecToSvec(eye, &node->outA);
-        vs_ribbon_gtePush(&offsets[1]);
-        vs_ribbon_gtePull(target);
+        gte_ldv0(&offsets[1]);
+        gte_rtv0tr2();
+        gte_stlvnl(target);
         vs_battle_vecToSvec(target, &node->outB);
     }
 }
